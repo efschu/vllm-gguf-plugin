@@ -148,10 +148,13 @@ class Qwen35GGUFAdapter(GGUFWeightsAdapter):
         return any(a in _MTP_ARCHITECTURES for a in archs)
 
     def _is_multimodal(self) -> bool:
-        return (
-            not self._is_mtp()
-            and getattr(self.config, "vision_config", None) is not None
-        )
+        # A vision_config alone is not enough: without an mmproj file the
+        # config parser downgrades to the text-only causal-LM class, and
+        # then only the text weights must be loaded.
+        if self._is_mtp() or getattr(self.config, "vision_config", None) is None:
+            return False
+        archs = getattr(self.config, "architectures", None) or []
+        return any("ForConditionalGeneration" in a for a in archs)
 
     def _get_all_gguf_files(self, model_path: str) -> list[str]:
         # Shadows the base staticmethod: multimodal models additionally

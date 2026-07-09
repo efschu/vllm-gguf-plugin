@@ -57,9 +57,13 @@ class GGUFConfig(QuantizationConfig):
 
     @classmethod
     def override_quantization_method(
-        cls, hf_quant_cfg: dict[str, Any], user_quant: str | None
+        cls,
+        hf_quant_cfg: dict[str, Any],
+        user_quant: str | None,
+        **kwargs: Any,
     ) -> "QuantizationMethods | None":
-        del hf_quant_cfg
+        # **kwargs absorbs newer vLLM probe arguments (e.g. hf_config).
+        del hf_quant_cfg, kwargs
         if user_quant == "gguf":
             return "gguf"
         return None
