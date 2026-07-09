@@ -33,6 +33,7 @@ from gguf.quants import dequantize
 from transformers import AutoModelForCausalLM
 from vllm.logger import init_logger
 
+from ..gguf_utils import detect_gguf_multimodal
 from .default import GGUFWeightsAdapter
 
 if TYPE_CHECKING:
@@ -76,6 +77,41 @@ _MTP_NEXTN_TENSORS = {
 
 _LAYER_IDX_RE = re.compile(r"\.layers\.(\d+)\.")
 
+# Vision encoder (mmproj GGUF, arch "clip", projector qwen3vl_merger):
+# per-block tensors -> HF names inside model.visual.blocks.{i}.
+_VISION_BLOCK_TENSORS = {
+    "attn_qkv.weight": "attn.qkv.weight",
+    "attn_qkv.bias": "attn.qkv.bias",
+    "attn_out.weight": "attn.proj.weight",
+    "attn_out.bias": "attn.proj.bias",
+    "ffn_up.weight": "mlp.linear_fc1.weight",
+    "ffn_up.bias": "mlp.linear_fc1.bias",
+    "ffn_down.weight": "mlp.linear_fc2.weight",
+    "ffn_down.bias": "mlp.linear_fc2.bias",
+    "ln1.weight": "norm1.weight",
+    "ln1.bias": "norm1.bias",
+    "ln2.weight": "norm2.weight",
+    "ln2.bias": "norm2.bias",
+}
+
+# Top-level vision/merger tensors.  llama.cpp splits the Conv3d patch
+# embedding along the temporal dimension into weight / weight.1; they are
+# re-stacked in prepare_weights (see _PATCH_EMBED_*).
+_PATCH_EMBED_T0 = "model.visual.patch_embed.proj.weight.__t0"
+_PATCH_EMBED_T1 = "model.visual.patch_embed.proj.weight.__t1"
+_VISION_TOP_TENSORS = {
+    "v.patch_embd.weight": _PATCH_EMBED_T0,
+    "v.patch_embd.weight.1": _PATCH_EMBED_T1,
+    "v.patch_embd.bias": "model.visual.patch_embed.proj.bias",
+    "v.position_embd.weight": "model.visual.pos_embed.weight",
+    "v.post_ln.weight": "model.visual.merger.norm.weight",
+    "v.post_ln.bias": "model.visual.merger.norm.bias",
+    "mm.0.weight": "model.visual.merger.linear_fc1.weight",
+    "mm.0.bias": "model.visual.merger.linear_fc1.bias",
+    "mm.2.weight": "model.visual.merger.linear_fc2.weight",
+    "mm.2.bias": "model.visual.merger.linear_fc2.bias",
+}
+
 
 class Qwen35GGUFAdapter(GGUFWeightsAdapter):
     """qwen35/qwen35moe GGUF adapter (main model and MTP draft)."""
@@ -92,6 +128,7 @@ class Qwen35GGUFAdapter(GGUFWeightsAdapter):
     )
     _GEMMA_NORM_NAMES = (
         "model.norm.weight",
+        "model.language_model.norm.weight",
         "mtp.norm.weight",
         "mtp.pre_fc_norm_embedding.weight",
         "mtp.pre_fc_norm_hidden.weight",
@@ -110,6 +147,27 @@ class Qwen35GGUFAdapter(GGUFWeightsAdapter):
         archs = getattr(self.config, "architectures", None) or []
         return any(a in _MTP_ARCHITECTURES for a in archs)
 
+    def _is_multimodal(self) -> bool:
+        return (
+            not self._is_mtp()
+            and getattr(self.config, "vision_config", None) is not None
+        )
+
+    def _get_all_gguf_files(self, model_path: str) -> list[str]:
+        # Shadows the base staticmethod: multimodal models additionally
+        # read the vision encoder from the mmproj GGUF next to the model.
+        files = GGUFWeightsAdapter._get_all_gguf_files(model_path)
+        if self._is_multimodal():
+            mmproj = detect_gguf_multimodal(str(model_path))
+            if mmproj is None:
+                raise ValueError(
+                    "Multimodal qwen3_5 config (vision_config present) but "
+                    f"no mmproj*.gguf found next to {model_path}."
+                )
+            files = files + [str(mmproj)]
+            logger.info("qwen35 GGUF: loading vision encoder from %s", mmproj)
+        return files
+
     # ------------------------------------------------------------------
     # Name mapping
     # ------------------------------------------------------------------
@@ -117,7 +175,38 @@ class Qwen35GGUFAdapter(GGUFWeightsAdapter):
     def build_name_map(self, model_config: ModelConfig) -> dict[str, str]:
         if self._is_mtp():
             return self._build_mtp_name_map()
-        return self._build_main_name_map(model_config)
+        name_map = self._build_main_name_map(model_config)
+        if self._is_multimodal():
+            # The multimodal wrapper checkpoint prefixes the text model
+            # with "model.language_model." (lm_head stays top-level).
+            name_map = {
+                gguf_name: (
+                    "model.language_model." + hf_name[len("model.") :]
+                    if hf_name.startswith("model.")
+                    else hf_name
+                )
+                for gguf_name, hf_name in name_map.items()
+            }
+            name_map.update(self._build_vision_name_map())
+        return name_map
+
+    def _build_vision_name_map(self) -> dict[str, str]:
+        vision_config = self.config.vision_config
+        depth = getattr(vision_config, "depth", None) or getattr(
+            vision_config, "num_hidden_layers", 0
+        )
+        name_map = dict(_VISION_TOP_TENSORS)
+        for i in range(depth):
+            for gguf_local, hf_local in _VISION_BLOCK_TENSORS.items():
+                name_map[f"v.blk.{i}.{gguf_local}"] = (
+                    f"model.visual.blocks.{i}.{hf_local}"
+                )
+        logger.info(
+            "qwen35 GGUF vision name map: %d tensors for %d blocks",
+            len(name_map),
+            depth,
+        )
+        return name_map
 
     def _build_mtp_name_map(self) -> dict[str, str]:
         text_config = self.config.get_text_config()
@@ -307,7 +396,20 @@ class Qwen35GGUFAdapter(GGUFWeightsAdapter):
             qtype = int(gguf.GGMLQuantizationType[type_name])
             if self._out_proj_dequant_needed(qtype):
                 unquantized.append(name.removesuffix(".weight"))
-        return unquantized
+        # The quant-skip check compares against vLLM layer prefixes, which
+        # differ from the HF checkpoint names for the multimodal wrapper
+        # ("model.visual." -> "visual.", "model.language_model." ->
+        # "language_model.model.").  Add the remapped spellings.
+        remapped = []
+        for name in unquantized:
+            if name.startswith("model.visual."):
+                remapped.append("visual." + name[len("model.visual.") :])
+            elif name.startswith("model.language_model."):
+                remapped.append(
+                    "language_model.model."
+                    + name[len("model.language_model.") :]
+                )
+        return unquantized + remapped
 
     def _undo_gdn_reorder(
         self,
@@ -379,10 +481,32 @@ class Qwen35GGUFAdapter(GGUFWeightsAdapter):
         # parameter.  A quantized token_embd from the GGUF file must be
         # dequantized on the fly or it would be silently skipped and the
         # embedding would stay uninitialized.
-        embed_prefix = "model.embed_tokens."
+        embed_prefix = (
+            "model.language_model.embed_tokens."
+            if self._is_multimodal()
+            else "model.embed_tokens."
+        )
         embed_qtype: int | None = None
         qweight_types: dict[str, int] = {}
+        patch_embed_parts: dict[str, torch.Tensor] = {}
         for name, weight in super().prepare_weights(model_config):
+            if name in (_PATCH_EMBED_T0, _PATCH_EMBED_T1):
+                # llama.cpp splits the Conv3d patch embedding along the
+                # temporal dimension; HF expects (out, in, T, H, W).
+                patch_embed_parts[name] = weight
+                if len(patch_embed_parts) == 2:
+                    fused = torch.stack(
+                        [
+                            patch_embed_parts[_PATCH_EMBED_T0],
+                            patch_embed_parts[_PATCH_EMBED_T1],
+                        ],
+                        dim=2,
+                    )
+                    yield (
+                        "model.visual.patch_embed.proj.weight",
+                        fused.to(model_config.dtype),
+                    )
+                continue
             if name == embed_prefix + "qweight_type":
                 embed_qtype = int(weight.item())
                 continue

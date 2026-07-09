@@ -9,6 +9,7 @@ from vllm.transformers_utils.config_parser_base import ConfigParserBase
 
 from .gguf_utils import (
     check_gguf_file,
+    detect_gguf_multimodal,
     is_gguf,
     is_remote_gguf,
     maybe_patch_hf_config_from_gguf,
@@ -39,12 +40,28 @@ class GGUFConfigParser(ConfigParserBase):
             config_dict["norm_topk_prob"] = True
             config.update({"norm_topk_prob": True})
 
-        if config.model_type not in MODEL_FOR_CAUSAL_LM_MAPPING_NAMES:
-            raise RuntimeError(f"Can't get gguf config for {config.model_type}.")
+        # Multimodal GGUF (mmproj file next to the model, multimodal
+        # config): keep the original conditional-generation architecture
+        # instead of forcing the text-only causal-LM class.  Note that
+        # the engine-args patch may have already replaced the model path
+        # with its config-source DIRECTORY, so check both spellings.
+        mmproj_present = False
+        if check_gguf_file(original_model):
+            mmproj_present = detect_gguf_multimodal(str(original_model)) is not None
+        elif Path(original_model).is_dir():
+            mmproj_present = any(Path(original_model).glob("*mmproj*.gguf"))
+        is_multimodal_gguf = (
+            mmproj_present
+            and getattr(config, "vision_config", None) is not None
+            and config_dict.get("architectures")
+        )
+        if not is_multimodal_gguf:
+            if config.model_type not in MODEL_FOR_CAUSAL_LM_MAPPING_NAMES:
+                raise RuntimeError(f"Can't get gguf config for {config.model_type}.")
 
-        model_type = MODEL_FOR_CAUSAL_LM_MAPPING_NAMES[config.model_type]
-        config_dict["architectures"] = [model_type]
-        config.update({"architectures": [model_type]})
+            model_type = MODEL_FOR_CAUSAL_LM_MAPPING_NAMES[config.model_type]
+            config_dict["architectures"] = [model_type]
+            config.update({"architectures": [model_type]})
 
         if is_gguf(original_model):
             config = maybe_patch_hf_config_from_gguf(str(original_model), config)
