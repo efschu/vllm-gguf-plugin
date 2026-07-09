@@ -42,6 +42,13 @@ def _resolve_gguf_weight_type_loader(
         if loaded_shard_id is None and hasattr(param, "_store"):
             param._store(loaded_weight)
             return
+        if isinstance(loaded_shard_id, tuple) and hasattr(param, "_store"):
+            # One fused checkpoint tensor loads several shards of a merged
+            # layer at once (e.g. Qwen3.5 GDN in_proj_qkv -> shards
+            # (0, 1, 2) of in_proj_qkvz); they all share one GGML type.
+            for shard_id in loaded_shard_id:
+                param._store(loaded_weight, shard_id)
+            return
         base_loader(param, loaded_weight, loaded_shard_id)
 
     return _gguf_weight_type_loader_v2
@@ -344,6 +351,12 @@ def _materialize_gguf_weight_parameter(
     if hasattr(raw_param, "ignore_warning"):
         qweight.ignore_warning = raw_param.ignore_warning
     layer.register_parameter(param_name, qweight)
+    # The retired lazy parameter can stay alive through references the GC
+    # cannot break; drop its containers so the GPU staging clones of every
+    # shard are actually freed (several GiB on merged-heavy models).
+    raw_param.data_container.clear()
+    raw_param.shard_id.clear()
+    raw_param.shard_id_map.clear()
 
 
 def _materialize_gguf_weight_type_parameter(
