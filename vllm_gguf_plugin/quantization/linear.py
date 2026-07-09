@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import os
+
 import gguf
 import torch
 from gguf import GGMLQuantizationType as WeightType
@@ -31,6 +33,13 @@ from .utils import (
 )
 
 
+# Above this many tokens the MMQ kernels lose against dequantize +
+# cuBLAS GEMM (memory-bound dequant, then tensor-core matmul). Measured
+# crossover on RTX 3080 / Q6_K 17408x5120: ~16 tokens; at 1600 tokens
+# dequant+GEMM is ~13x faster. Tune with VLLM_GGUF_MMQ_MAX_TOKENS.
+_MMQ_MAX_TOKENS = int(os.environ.get("VLLM_GGUF_MMQ_MAX_TOKENS", "16"))
+
+
 def _fused_mul_mat_gguf(
     x: torch.Tensor, qweight: torch.Tensor, qweight_type: int
 ) -> torch.Tensor:
@@ -44,7 +53,10 @@ def _fused_mul_mat_gguf(
         return x @ qweight.T
     if x.shape[0] <= mmvq_safe and qweight_type in MMVQ_QUANT_TYPES:
         y = ops.ggml_mul_mat_vec_a8(qweight, x, qweight_type, qweight.shape[0])
-    elif qweight_type in MMQ_QUANT_TYPES:
+    elif (
+        qweight_type in MMQ_QUANT_TYPES
+        and (x.shape[0] <= _MMQ_MAX_TOKENS or qweight_type not in DEQUANT_TYPES)
+    ):
         y = ops.ggml_mul_mat_a8(qweight, x, qweight_type, qweight.shape[0])
     elif qweight_type in DEQUANT_TYPES:
         block_size, type_size = gguf.GGML_QUANT_SIZES[qweight_type]
