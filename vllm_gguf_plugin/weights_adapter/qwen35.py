@@ -282,6 +282,33 @@ class Qwen35GGUFAdapter(GGUFWeightsAdapter):
         perm[d], perm[d + 1] = perm[d + 1], perm[d]
         return weight.permute(*perm).contiguous().reshape(*shape)
 
+    def _v_retiling_active(self) -> bool:
+        text_config = self.config.get_text_config()
+        num_k = getattr(text_config, "linear_num_key_heads", 0) or 0
+        num_v = getattr(text_config, "linear_num_value_heads", 0) or 0
+        return num_k > 0 and num_v > 0 and num_k != num_v
+
+    def _out_proj_dequant_needed(self, qtype: int) -> bool:
+        """out_proj columns must be un-tiled; raw-byte permutation is only
+        exact when a v head spans whole quantization blocks.  Otherwise the
+        tensor is dequantized and loaded unquantized."""
+        if not self._v_retiling_active():
+            return False
+        text_config = self.config.get_text_config()
+        head_v_dim = getattr(text_config, "linear_value_head_dim", 0)
+        block_size, _ = gguf.GGML_QUANT_SIZES[gguf.GGMLQuantizationType(qtype)]
+        return head_v_dim % block_size != 0
+
+    def get_unquantized_modules(self, weight_type_map: dict[str, str]) -> list[str]:
+        unquantized = GGUFWeightsAdapter.get_unquantized_modules(weight_type_map)
+        for name, type_name in weight_type_map.items():
+            if not name.endswith("linear_attn.out_proj.weight"):
+                continue
+            qtype = int(gguf.GGMLQuantizationType[type_name])
+            if self._out_proj_dequant_needed(qtype):
+                unquantized.append(name.removesuffix(".weight"))
+        return unquantized
+
     def _undo_gdn_reorder(
         self,
         hf_name: str,
@@ -377,6 +404,40 @@ class Qwen35GGUFAdapter(GGUFWeightsAdapter):
                 continue
             if name.endswith(".qweight_type"):
                 qweight_types[name.removesuffix("_type")] = int(weight.item())
+                if name.endswith(
+                    "linear_attn.out_proj.qweight_type"
+                ) and self._out_proj_dequant_needed(int(weight.item())):
+                    # Layer is created unquantized (see
+                    # get_unquantized_modules); it has no qweight_type param.
+                    continue
+            elif name.endswith("linear_attn.out_proj.qweight"):
+                qtype = qweight_types.get(name)
+                assert qtype is not None, "out_proj qweight_type not seen yet"
+                if self._out_proj_dequant_needed(qtype):
+                    # Block-misaligned quantization (e.g. K-quants with
+                    # head_v_dim=128): dequantize, un-tile columns
+                    # element-wise, load as plain weight.
+                    text_config = self.config.get_text_config()
+                    dequantized = torch.from_numpy(
+                        dequantize(
+                            weight.numpy(), gguf.GGMLQuantizationType(qtype)
+                        )
+                    )
+                    dequantized = self._undo_v_tiling(
+                        dequantized, 1, text_config.linear_value_head_dim
+                    )
+                    logger.info_once(
+                        "Dequantized GDN out_proj (%s) to %s to undo the "
+                        "v-head reorder (head_v_dim not block-aligned)",
+                        gguf.GGMLQuantizationType(qtype).name,
+                        model_config.dtype,
+                    )
+                    yield (
+                        name.removesuffix(".qweight") + ".weight",
+                        dequantized.to(model_config.dtype),
+                    )
+                    continue
+                weight = self._undo_gdn_reorder(name, weight, qweight_types)
             elif ".linear_attn." in name:
                 weight = self._undo_gdn_reorder(name, weight, qweight_types)
             yield name, weight
