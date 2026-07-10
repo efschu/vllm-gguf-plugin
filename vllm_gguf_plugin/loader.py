@@ -76,6 +76,20 @@ class GGUFModelLoader(BaseModelLoader):
         self._prepare_weights(model_config)
 
     def load_weights(self, model: nn.Module, model_config: ModelConfig) -> None:
+        try:
+            from vllm.distributed.utils import get_tp_partition_ratios
+        except ImportError:
+            get_tp_partition_ratios = lambda: None  # older vLLM
+        if get_tp_partition_ratios():
+            raise NotImplementedError(
+                "--rank-tp-ratio (uneven tensor parallelism) is not "
+                "supported for GGUF models yet: the GGUF weight loaders "
+                "compute even rank*shard offsets and packed quant blocks "
+                "(e.g. 256-element K-quant superblocks) additionally "
+                "require per-rank shard boundaries to be block-aligned. "
+                "Use even TP for GGUF, or a non-GGUF checkpoint with "
+                "--rank-tp-ratio."
+            )
         adapter = self._prepare_adapter(model_config)
         model.load_weights(adapter.prepare_weights(model_config))
 
