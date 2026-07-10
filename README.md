@@ -4,6 +4,31 @@ This plugin provides out-of-tree GGUF quantization support for vLLM after
 in-tree support deprecation
 ([vllm-project/vllm#39583](https://github.com/vllm-project/vllm/issues/39583)).
 
+## This fork: Qwen3.5/3.6 support (branch `qwen35-support`)
+
+Additions on top of upstream:
+
+- **Qwen3.5/3.6 (dense + MoE) GGUF support** — full weight adapter incl.
+  inversion of the llama.cpp conversion transforms (Gemma-style norms,
+  `ssm_a`, GDN v-head retiling). All GGUF quant types; K-quants with
+  misaligned packed columns fall back to dequant transparently.
+- **MTP speculative decoding from the GGUF** — the file's own MTP layer is
+  mapped as draft model (`--speculative-config '{"method":"mtp",...}'`).
+- **Vision**: drop the matching `mmproj-*.gguf` next to the model file and
+  multimodality is enabled automatically (image inputs via OpenAI API).
+- **~8× faster prefill** for all GGUF models: MMQ kernels are only used up to
+  `VLLM_GGUF_MMQ_MAX_TOKENS` (default 16) tokens; larger batches dequantize
+  and use cuBLAS.
+- Loader fixes: tuple shard ids (hybrid/GDN models), a ~6 GiB/rank load-time
+  memory leak, embedding dequant fallback, newer-vLLM compatibility.
+
+Usage: place `config.json` + tokenizer files (from the original HF repo) next
+to the `.gguf`, then `vllm serve /path/to/model.gguf`. Requires the
+[shvllm fork](https://github.com/efschu/shvllm/tree/qwen35-gguf-rankgpu) (or a
+vLLM with its Qwen3.5 core fixes) for this model family; other architectures
+work with stock vLLM. A prebuilt Docker image with both is available:
+`ghcr.io/efschu/shvllm-qwen35-gguf:cu129`.
+
 ## Installation
 
 ### Prerequisites
