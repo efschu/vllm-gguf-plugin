@@ -46,7 +46,12 @@ def _fused_mul_mat_gguf(
     if qweight_type in IMATRIX_QUANT_TYPES:
         mmvq_safe = 8 if qweight.shape[0] > 5120 else 16
     else:
-        mmvq_safe = 2 if qweight.shape[0] > 5120 else 6
+        # Measured on RTX 3080/5090 with the batched MMVQ + small-batch MMQ
+        # tile: MMVQ only wins up to 2 tokens regardless of matrix shape;
+        # from 3 tokens the 8-wide MMQ tile is faster (the old value of 6
+        # for narrow matrices sent every MTP decode step, batch = 1 + num
+        # drafts, through the slower path).
+        mmvq_safe = 2
     if x.shape[0] == 0:
         return torch.empty(x.shape[0], qweight.shape[0], dtype=x.dtype, device=x.device)
     if qweight_type in UNQUANTIZED_TYPES:

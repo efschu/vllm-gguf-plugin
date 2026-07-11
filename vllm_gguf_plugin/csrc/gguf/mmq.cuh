@@ -129,10 +129,42 @@ mul_mat_q4_0(
         (vx, vy, dst, ncols_x, nrows_x, ncols_y, nrows_y, nrows_dst);
 }
 
+// Small-batch variant: decode-sized ncols_y (<= 8). The 64-wide batch
+// tile pads a 4-token MTP step ~16x with dead MACs and turns the kernel
+// compute-bound; an 8-wide tile keeps it weight-bandwidth-bound.
+template<typename scalar_t, bool need_check> static __global__ void
+#if defined(USE_ROCM)
+__launch_bounds__(WARP_SIZE_GGUF*8, 2)
+#endif
+mul_mat_q4_0_small(
+    const void * __restrict__ vx, const void * __restrict__ vy, scalar_t * __restrict__ dst,
+    const int ncols_x, const int nrows_x, const int ncols_y, const int nrows_y, const int nrows_dst) {
+    const int mmq_x  = 8;
+    const int mmq_y  = 64;
+    const int nwarps = 8;
+
+    mul_mat_q<scalar_t, QK4_0, QR4_0, QI4_0, true, block_q4_0, mmq_x, mmq_y, nwarps, allocate_tiles_q4_0<mmq_y>,
+        load_tiles_q4_0<mmq_y, nwarps, need_check>, VDR_Q4_0_Q8_1_MMQ, vec_dot_q4_0_q8_1_mul_mat>
+        (vx, vy, dst, ncols_x, nrows_x, ncols_y, nrows_y, nrows_dst);
+}
+
 template<typename scalar_t>
 static void ggml_mul_mat_q4_0_q8_1_cuda(
     const void * vx, const void * vy, scalar_t * dst, const int ncols_x, const int nrows_x,
     const int ncols_y, const int nrows_y, const int nrows_dst, cudaStream_t stream) {
+    if (ncols_y <= 8) {
+        const int small_y = 64;
+        const dim3 block_nums((nrows_x + small_y - 1) / small_y, 1, 1);
+        const dim3 block_dims(WARP_SIZE_GGUF, 8, 1);
+        if (nrows_x % small_y == 0) {
+            mul_mat_q4_0_small<scalar_t, false><<<block_nums, block_dims, 0, stream>>>
+                (vx, vy, dst, ncols_x, nrows_x, ncols_y, nrows_y, nrows_dst);
+        } else {
+            mul_mat_q4_0_small<scalar_t, true><<<block_nums, block_dims, 0, stream>>>
+                (vx, vy, dst, ncols_x, nrows_x, ncols_y, nrows_y, nrows_dst);
+        }
+        return;
+    }
 
     int mmq_x  =  MMQ_X_Q4_0;
     int mmq_y  =  MMQ_Y_Q4_0;
@@ -180,10 +212,42 @@ mul_mat_q4_1(
         (vx, vy, dst, ncols_x, nrows_x, ncols_y, nrows_y, nrows_dst);
 }
 
+// Small-batch variant: decode-sized ncols_y (<= 8). The 64-wide batch
+// tile pads a 4-token MTP step ~16x with dead MACs and turns the kernel
+// compute-bound; an 8-wide tile keeps it weight-bandwidth-bound.
+template<typename scalar_t, bool need_check> static __global__ void
+#if defined(USE_ROCM)
+__launch_bounds__(WARP_SIZE_GGUF*8, 2)
+#endif
+mul_mat_q4_1_small(
+    const void * __restrict__ vx, const void * __restrict__ vy, scalar_t * __restrict__ dst,
+    const int ncols_x, const int nrows_x, const int ncols_y, const int nrows_y, const int nrows_dst) {
+    const int mmq_x  = 8;
+    const int mmq_y  = 64;
+    const int nwarps = 8;
+
+    mul_mat_q<scalar_t, QK4_1, QR4_1, QI4_1, true, block_q4_1, mmq_x, mmq_y, nwarps, allocate_tiles_q4_1<mmq_y>,
+        load_tiles_q4_1<mmq_y, nwarps, need_check>, VDR_Q4_1_Q8_1_MMQ, vec_dot_q4_1_q8_1_mul_mat>
+        (vx, vy, dst, ncols_x, nrows_x, ncols_y, nrows_y, nrows_dst);
+}
+
 template<typename scalar_t>
 static void ggml_mul_mat_q4_1_q8_1_cuda(
     const void * vx, const void * vy, scalar_t * dst, const int ncols_x, const int nrows_x,
     const int ncols_y, const int nrows_y, const int nrows_dst, cudaStream_t stream) {
+    if (ncols_y <= 8) {
+        const int small_y = 64;
+        const dim3 block_nums((nrows_x + small_y - 1) / small_y, 1, 1);
+        const dim3 block_dims(WARP_SIZE_GGUF, 8, 1);
+        if (nrows_x % small_y == 0) {
+            mul_mat_q4_1_small<scalar_t, false><<<block_nums, block_dims, 0, stream>>>
+                (vx, vy, dst, ncols_x, nrows_x, ncols_y, nrows_y, nrows_dst);
+        } else {
+            mul_mat_q4_1_small<scalar_t, true><<<block_nums, block_dims, 0, stream>>>
+                (vx, vy, dst, ncols_x, nrows_x, ncols_y, nrows_y, nrows_dst);
+        }
+        return;
+    }
 
     int mmq_x  =  MMQ_X_Q4_1;
     int mmq_y  =  MMQ_Y_Q4_1;
@@ -231,10 +295,42 @@ mul_mat_q5_0(
         (vx, vy, dst, ncols_x, nrows_x, ncols_y, nrows_y, nrows_dst);
 }
 
+// Small-batch variant: decode-sized ncols_y (<= 8). The 64-wide batch
+// tile pads a 4-token MTP step ~16x with dead MACs and turns the kernel
+// compute-bound; an 8-wide tile keeps it weight-bandwidth-bound.
+template<typename scalar_t, bool need_check> static __global__ void
+#if defined(USE_ROCM)
+__launch_bounds__(WARP_SIZE_GGUF*8, 2)
+#endif
+mul_mat_q5_0_small(
+    const void * __restrict__ vx, const void * __restrict__ vy, scalar_t * __restrict__ dst,
+    const int ncols_x, const int nrows_x, const int ncols_y, const int nrows_y, const int nrows_dst) {
+    const int mmq_x  = 8;
+    const int mmq_y  = 64;
+    const int nwarps = 8;
+
+    mul_mat_q<scalar_t, QK5_0, QR5_0, QI5_0, false, block_q5_0, mmq_x, mmq_y, nwarps, allocate_tiles_q5_0<mmq_y>,
+        load_tiles_q5_0<mmq_y, nwarps, need_check>, VDR_Q5_0_Q8_1_MMQ, vec_dot_q5_0_q8_1_mul_mat>
+        (vx, vy, dst, ncols_x, nrows_x, ncols_y, nrows_y, nrows_dst);
+}
+
 template<typename scalar_t>
 static void ggml_mul_mat_q5_0_q8_1_cuda(
     const void * vx, const void * vy, scalar_t * dst, const int ncols_x, const int nrows_x,
     const int ncols_y, const int nrows_y, const int nrows_dst, cudaStream_t stream) {
+    if (ncols_y <= 8) {
+        const int small_y = 64;
+        const dim3 block_nums((nrows_x + small_y - 1) / small_y, 1, 1);
+        const dim3 block_dims(WARP_SIZE_GGUF, 8, 1);
+        if (nrows_x % small_y == 0) {
+            mul_mat_q5_0_small<scalar_t, false><<<block_nums, block_dims, 0, stream>>>
+                (vx, vy, dst, ncols_x, nrows_x, ncols_y, nrows_y, nrows_dst);
+        } else {
+            mul_mat_q5_0_small<scalar_t, true><<<block_nums, block_dims, 0, stream>>>
+                (vx, vy, dst, ncols_x, nrows_x, ncols_y, nrows_y, nrows_dst);
+        }
+        return;
+    }
 
     const int mmq_x  =  MMQ_X_Q5_0;
     const int mmq_y  =  MMQ_Y_Q5_0;
@@ -282,10 +378,42 @@ mul_mat_q5_1(
         (vx, vy, dst, ncols_x, nrows_x, ncols_y, nrows_y, nrows_dst);
 }
 
+// Small-batch variant: decode-sized ncols_y (<= 8). The 64-wide batch
+// tile pads a 4-token MTP step ~16x with dead MACs and turns the kernel
+// compute-bound; an 8-wide tile keeps it weight-bandwidth-bound.
+template<typename scalar_t, bool need_check> static __global__ void
+#if defined(USE_ROCM)
+__launch_bounds__(WARP_SIZE_GGUF*8, 2)
+#endif
+mul_mat_q5_1_small(
+    const void * __restrict__ vx, const void * __restrict__ vy, scalar_t * __restrict__ dst,
+    const int ncols_x, const int nrows_x, const int ncols_y, const int nrows_y, const int nrows_dst) {
+    const int mmq_x  = 8;
+    const int mmq_y  = 64;
+    const int nwarps = 8;
+
+    mul_mat_q<scalar_t, QK5_1, QR5_1, QI5_1, true, block_q5_1, mmq_x, mmq_y, nwarps, allocate_tiles_q5_1<mmq_y>,
+        load_tiles_q5_1<mmq_y, nwarps, need_check>, VDR_Q5_1_Q8_1_MMQ, vec_dot_q5_1_q8_1_mul_mat>
+        (vx, vy, dst, ncols_x, nrows_x, ncols_y, nrows_y, nrows_dst);
+}
+
 template<typename scalar_t>
 static void ggml_mul_mat_q5_1_q8_1_cuda(
     const void * vx, const void * vy, scalar_t * dst, const int ncols_x, const int nrows_x,
     const int ncols_y, const int nrows_y, const int nrows_dst, cudaStream_t stream) {
+    if (ncols_y <= 8) {
+        const int small_y = 64;
+        const dim3 block_nums((nrows_x + small_y - 1) / small_y, 1, 1);
+        const dim3 block_dims(WARP_SIZE_GGUF, 8, 1);
+        if (nrows_x % small_y == 0) {
+            mul_mat_q5_1_small<scalar_t, false><<<block_nums, block_dims, 0, stream>>>
+                (vx, vy, dst, ncols_x, nrows_x, ncols_y, nrows_y, nrows_dst);
+        } else {
+            mul_mat_q5_1_small<scalar_t, true><<<block_nums, block_dims, 0, stream>>>
+                (vx, vy, dst, ncols_x, nrows_x, ncols_y, nrows_y, nrows_dst);
+        }
+        return;
+    }
     const int mmq_x  =  MMQ_X_Q5_1;
     const int mmq_y  =  MMQ_Y_Q5_1;
     const int nwarps = NWARPS_Q5_1;
@@ -332,10 +460,42 @@ mul_mat_q8_0(
         (vx, vy, dst, ncols_x, nrows_x, ncols_y, nrows_y, nrows_dst);
 }
 
+// Small-batch variant: decode-sized ncols_y (<= 8). The 64-wide batch
+// tile pads a 4-token MTP step ~16x with dead MACs and turns the kernel
+// compute-bound; an 8-wide tile keeps it weight-bandwidth-bound.
+template<typename scalar_t, bool need_check> static __global__ void
+#if defined(USE_ROCM)
+__launch_bounds__(WARP_SIZE_GGUF*8, 2)
+#endif
+mul_mat_q8_0_small(
+    const void * __restrict__ vx, const void * __restrict__ vy, scalar_t * __restrict__ dst,
+    const int ncols_x, const int nrows_x, const int ncols_y, const int nrows_y, const int nrows_dst) {
+    const int mmq_x  = 8;
+    const int mmq_y  = 64;
+    const int nwarps = 8;
+
+    mul_mat_q<scalar_t, QK8_0, QR8_0, QI8_0, false, block_q8_0, mmq_x, mmq_y, nwarps, allocate_tiles_q8_0<mmq_y>,
+        load_tiles_q8_0<mmq_y, nwarps, need_check>, VDR_Q8_0_Q8_1_MMQ, vec_dot_q8_0_q8_1_mul_mat>
+        (vx, vy, dst, ncols_x, nrows_x, ncols_y, nrows_y, nrows_dst);
+}
+
 template<typename scalar_t>
 static void ggml_mul_mat_q8_0_q8_1_cuda(
     const void * vx, const void * vy, scalar_t * dst, const int ncols_x, const int nrows_x,
     const int ncols_y, const int nrows_y, const int nrows_dst, cudaStream_t stream) {
+    if (ncols_y <= 8) {
+        const int small_y = 64;
+        const dim3 block_nums((nrows_x + small_y - 1) / small_y, 1, 1);
+        const dim3 block_dims(WARP_SIZE_GGUF, 8, 1);
+        if (nrows_x % small_y == 0) {
+            mul_mat_q8_0_small<scalar_t, false><<<block_nums, block_dims, 0, stream>>>
+                (vx, vy, dst, ncols_x, nrows_x, ncols_y, nrows_y, nrows_dst);
+        } else {
+            mul_mat_q8_0_small<scalar_t, true><<<block_nums, block_dims, 0, stream>>>
+                (vx, vy, dst, ncols_x, nrows_x, ncols_y, nrows_y, nrows_dst);
+        }
+        return;
+    }
     const int mmq_x  =  MMQ_X_Q8_0;
     const int mmq_y  =  MMQ_Y_Q8_0;
     const int nwarps = NWARPS_Q8_0;
@@ -382,10 +542,42 @@ mul_mat_q2_K(
         (vx, vy, dst, ncols_x, nrows_x, ncols_y, nrows_y, nrows_dst);
 }
 
+// Small-batch variant: decode-sized ncols_y (<= 8). The 64-wide batch
+// tile pads a 4-token MTP step ~16x with dead MACs and turns the kernel
+// compute-bound; an 8-wide tile keeps it weight-bandwidth-bound.
+template<typename scalar_t, bool need_check> static __global__ void
+#if defined(USE_ROCM)
+__launch_bounds__(WARP_SIZE_GGUF*8, 2)
+#endif
+mul_mat_q2_K_small(
+    const void * __restrict__ vx, const void * __restrict__ vy, scalar_t * __restrict__ dst,
+    const int ncols_x, const int nrows_x, const int ncols_y, const int nrows_y, const int nrows_dst) {
+    const int mmq_x  = 8;
+    const int mmq_y  = 64;
+    const int nwarps = 8;
+
+    mul_mat_q<scalar_t, QK_K, QR2_K, QI2_K, false, block_q2_K, mmq_x, mmq_y, nwarps, allocate_tiles_q2_K<mmq_y>,
+        load_tiles_q2_K<mmq_y, nwarps, need_check>, VDR_Q2_K_Q8_1_MMQ, vec_dot_q2_K_q8_1_mul_mat>
+        (vx, vy, dst, ncols_x, nrows_x, ncols_y, nrows_y, nrows_dst);
+}
+
 template<typename scalar_t>
 static void ggml_mul_mat_q2_K_q8_1_cuda(
     const void * vx, const void * vy, scalar_t * dst, const int ncols_x, const int nrows_x,
     const int ncols_y, const int nrows_y, const int nrows_dst, cudaStream_t stream) {
+    if (ncols_y <= 8) {
+        const int small_y = 64;
+        const dim3 block_nums((nrows_x + small_y - 1) / small_y, 1, 1);
+        const dim3 block_dims(WARP_SIZE_GGUF, 8, 1);
+        if (nrows_x % small_y == 0) {
+            mul_mat_q2_K_small<scalar_t, false><<<block_nums, block_dims, 0, stream>>>
+                (vx, vy, dst, ncols_x, nrows_x, ncols_y, nrows_y, nrows_dst);
+        } else {
+            mul_mat_q2_K_small<scalar_t, true><<<block_nums, block_dims, 0, stream>>>
+                (vx, vy, dst, ncols_x, nrows_x, ncols_y, nrows_y, nrows_dst);
+        }
+        return;
+    }
     const int mmq_x  =  MMQ_X_Q2_K;
     const int mmq_y  =  MMQ_Y_Q2_K;
     const int nwarps = NWARPS_Q2_K;
@@ -433,10 +625,43 @@ mul_mat_q3_K(
         (vx, vy, dst, ncols_x, nrows_x, ncols_y, nrows_y, nrows_dst);
 }
 
+// Small-batch variant: decode-sized ncols_y (<= 8). The 64-wide batch
+// tile pads a 4-token MTP step ~16x with dead MACs and turns the kernel
+// compute-bound; an 8-wide tile keeps it weight-bandwidth-bound.
+template<typename scalar_t, bool need_check> static __global__ void
+#if defined(USE_ROCM)
+__launch_bounds__(WARP_SIZE_GGUF*8, 2)
+#endif
+mul_mat_q3_K_small(
+    const void * __restrict__ vx, const void * __restrict__ vy, scalar_t * __restrict__ dst,
+    const int ncols_x, const int nrows_x, const int ncols_y, const int nrows_y, const int nrows_dst) {
+
+    const int mmq_x  = 8;
+    const int mmq_y  = 64;
+    const int nwarps = 8;
+
+    mul_mat_q<scalar_t, QK_K, QR3_K, QI3_K, false, block_q3_K, mmq_x, mmq_y, nwarps, allocate_tiles_q3_K<mmq_y>,
+        load_tiles_q3_K<mmq_y, nwarps, need_check>, VDR_Q3_K_Q8_1_MMQ, vec_dot_q3_K_q8_1_mul_mat>
+        (vx, vy, dst, ncols_x, nrows_x, ncols_y, nrows_y, nrows_dst);
+}
+
 template<typename scalar_t>
 static void ggml_mul_mat_q3_K_q8_1_cuda(
     const void * vx, const void * vy, scalar_t * dst, const int ncols_x, const int nrows_x,
     const int ncols_y, const int nrows_y, const int nrows_dst, cudaStream_t stream) {
+    if (ncols_y <= 8) {
+        const int small_y = 64;
+        const dim3 block_nums((nrows_x + small_y - 1) / small_y, 1, 1);
+        const dim3 block_dims(WARP_SIZE_GGUF, 8, 1);
+        if (nrows_x % small_y == 0) {
+            mul_mat_q3_K_small<scalar_t, false><<<block_nums, block_dims, 0, stream>>>
+                (vx, vy, dst, ncols_x, nrows_x, ncols_y, nrows_y, nrows_dst);
+        } else {
+            mul_mat_q3_K_small<scalar_t, true><<<block_nums, block_dims, 0, stream>>>
+                (vx, vy, dst, ncols_x, nrows_x, ncols_y, nrows_y, nrows_dst);
+        }
+        return;
+    }
 
     const int mmq_x  =  MMQ_X_Q3_K;
     const int mmq_y  =  MMQ_Y_Q3_K;
@@ -484,10 +709,42 @@ mul_mat_q4_K(
         (vx, vy, dst, ncols_x, nrows_x, ncols_y, nrows_y, nrows_dst);
 }
 
+// Small-batch variant: decode-sized ncols_y (<= 8). The 64-wide batch
+// tile pads a 4-token MTP step ~16x with dead MACs and turns the kernel
+// compute-bound; an 8-wide tile keeps it weight-bandwidth-bound.
+template<typename scalar_t, bool need_check> static __global__ void
+#if defined(USE_ROCM)
+__launch_bounds__(WARP_SIZE_GGUF*8, 2)
+#endif
+mul_mat_q4_K_small(
+    const void * __restrict__ vx, const void * __restrict__ vy, scalar_t * __restrict__ dst,
+    const int ncols_x, const int nrows_x, const int ncols_y, const int nrows_y, const int nrows_dst) {
+    const int mmq_x  = 8;
+    const int mmq_y  = 64;
+    const int nwarps = 8;
+
+    mul_mat_q<scalar_t, QK_K, QR4_K, QI4_K, true, block_q4_K, mmq_x, mmq_y, nwarps, allocate_tiles_q4_K<mmq_y>,
+        load_tiles_q4_K<mmq_y, nwarps, need_check>, VDR_Q4_K_Q8_1_MMQ, vec_dot_q4_K_q8_1_mul_mat>
+        (vx, vy, dst, ncols_x, nrows_x, ncols_y, nrows_y, nrows_dst);
+}
+
 template<typename scalar_t>
 static void ggml_mul_mat_q4_K_q8_1_cuda(
     const void * vx, const void * vy, scalar_t * dst, const int ncols_x, const int nrows_x,
     const int ncols_y, const int nrows_y, const int nrows_dst, cudaStream_t stream) {
+    if (ncols_y <= 8) {
+        const int small_y = 64;
+        const dim3 block_nums((nrows_x + small_y - 1) / small_y, 1, 1);
+        const dim3 block_dims(WARP_SIZE_GGUF, 8, 1);
+        if (nrows_x % small_y == 0) {
+            mul_mat_q4_K_small<scalar_t, false><<<block_nums, block_dims, 0, stream>>>
+                (vx, vy, dst, ncols_x, nrows_x, ncols_y, nrows_y, nrows_dst);
+        } else {
+            mul_mat_q4_K_small<scalar_t, true><<<block_nums, block_dims, 0, stream>>>
+                (vx, vy, dst, ncols_x, nrows_x, ncols_y, nrows_y, nrows_dst);
+        }
+        return;
+    }
     const int mmq_x  =  MMQ_X_Q4_K;
     const int mmq_y  =  MMQ_Y_Q4_K;
     const int nwarps = NWARPS_Q4_K;
@@ -534,10 +791,42 @@ mul_mat_q5_K(
         (vx, vy, dst, ncols_x, nrows_x, ncols_y, nrows_y, nrows_dst);
 }
 
+// Small-batch variant: decode-sized ncols_y (<= 8). The 64-wide batch
+// tile pads a 4-token MTP step ~16x with dead MACs and turns the kernel
+// compute-bound; an 8-wide tile keeps it weight-bandwidth-bound.
+template<typename scalar_t, bool need_check> static __global__ void
+#if defined(USE_ROCM)
+__launch_bounds__(WARP_SIZE_GGUF*8, 2)
+#endif
+mul_mat_q5_K_small(
+    const void * __restrict__ vx, const void * __restrict__ vy, scalar_t * __restrict__ dst,
+    const int ncols_x, const int nrows_x, const int ncols_y, const int nrows_y, const int nrows_dst) {
+    const int mmq_x  = 8;
+    const int mmq_y  = 64;
+    const int nwarps = 8;
+
+    mul_mat_q<scalar_t, QK_K, QR5_K, QI5_K, true, block_q5_K, mmq_x, mmq_y, nwarps, allocate_tiles_q5_K<mmq_y>,
+        load_tiles_q5_K<mmq_y, nwarps, need_check>, VDR_Q5_K_Q8_1_MMQ, vec_dot_q5_K_q8_1_mul_mat>
+        (vx, vy, dst, ncols_x, nrows_x, ncols_y, nrows_y, nrows_dst);
+}
+
 template<typename scalar_t>
 static void ggml_mul_mat_q5_K_q8_1_cuda(
     const void * vx, const void * vy, scalar_t * dst, const int ncols_x, const int nrows_x,
     const int ncols_y, const int nrows_y, const int nrows_dst, cudaStream_t stream) {
+    if (ncols_y <= 8) {
+        const int small_y = 64;
+        const dim3 block_nums((nrows_x + small_y - 1) / small_y, 1, 1);
+        const dim3 block_dims(WARP_SIZE_GGUF, 8, 1);
+        if (nrows_x % small_y == 0) {
+            mul_mat_q5_K_small<scalar_t, false><<<block_nums, block_dims, 0, stream>>>
+                (vx, vy, dst, ncols_x, nrows_x, ncols_y, nrows_y, nrows_dst);
+        } else {
+            mul_mat_q5_K_small<scalar_t, true><<<block_nums, block_dims, 0, stream>>>
+                (vx, vy, dst, ncols_x, nrows_x, ncols_y, nrows_y, nrows_dst);
+        }
+        return;
+    }
 
     const int mmq_x  =  MMQ_X_Q5_K;
     const int mmq_y  =  MMQ_Y_Q5_K;
@@ -585,10 +874,42 @@ mul_mat_q6_K(
         (vx, vy, dst, ncols_x, nrows_x, ncols_y, nrows_y, nrows_dst);
 }
 
+// Small-batch variant: decode-sized ncols_y (<= 8). The 64-wide batch
+// tile pads a 4-token MTP step ~16x with dead MACs and turns the kernel
+// compute-bound; an 8-wide tile keeps it weight-bandwidth-bound.
+template<typename scalar_t, bool need_check> static __global__ void
+#if defined(USE_ROCM)
+__launch_bounds__(WARP_SIZE_GGUF*8, 2)
+#endif
+mul_mat_q6_K_small(
+    const void * __restrict__ vx, const void * __restrict__ vy, scalar_t * __restrict__ dst,
+    const int ncols_x, const int nrows_x, const int ncols_y, const int nrows_y, const int nrows_dst) {
+    const int mmq_x  = 8;
+    const int mmq_y  = 64;
+    const int nwarps = 8;
+
+    mul_mat_q<scalar_t, QK_K, QR6_K, QI6_K, false, block_q6_K, mmq_x, mmq_y, nwarps, allocate_tiles_q6_K<mmq_y>,
+        load_tiles_q6_K<mmq_y, nwarps, need_check>, VDR_Q6_K_Q8_1_MMQ, vec_dot_q6_K_q8_1_mul_mat>
+        (vx, vy, dst, ncols_x, nrows_x, ncols_y, nrows_y, nrows_dst);
+}
+
 template<typename scalar_t>
 static void ggml_mul_mat_q6_K_q8_1_cuda(
     const void * vx, const void * vy, scalar_t * dst, const int ncols_x, const int nrows_x,
     const int ncols_y, const int nrows_y, const int nrows_dst, cudaStream_t stream) {
+    if (ncols_y <= 8) {
+        const int small_y = 64;
+        const dim3 block_nums((nrows_x + small_y - 1) / small_y, 1, 1);
+        const dim3 block_dims(WARP_SIZE_GGUF, 8, 1);
+        if (nrows_x % small_y == 0) {
+            mul_mat_q6_K_small<scalar_t, false><<<block_nums, block_dims, 0, stream>>>
+                (vx, vy, dst, ncols_x, nrows_x, ncols_y, nrows_y, nrows_dst);
+        } else {
+            mul_mat_q6_K_small<scalar_t, true><<<block_nums, block_dims, 0, stream>>>
+                (vx, vy, dst, ncols_x, nrows_x, ncols_y, nrows_y, nrows_dst);
+        }
+        return;
+    }
     const int mmq_x  =  MMQ_X_Q6_K;
     const int mmq_y  =  MMQ_Y_Q6_K;
     const int nwarps = NWARPS_Q6_K;
