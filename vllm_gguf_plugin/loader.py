@@ -81,14 +81,15 @@ class GGUFModelLoader(BaseModelLoader):
         except ImportError:
             get_tp_partition_ratios = lambda: None  # older vLLM
         if get_tp_partition_ratios():
-            raise NotImplementedError(
-                "--rank-tp-ratio (uneven tensor parallelism) is not "
-                "supported for GGUF models yet: the GGUF weight loaders "
-                "compute even rank*shard offsets and packed quant blocks "
-                "(e.g. 256-element K-quant superblocks) additionally "
-                "require per-rank shard boundaries to be block-aligned. "
-                "Use even TP for GGUF, or a non-GGUF checkpoint with "
-                "--rank-tp-ratio."
+            # Uneven TP (--rank-tp-ratio): supported since the loaders in
+            # quantization/params.py shard via the fork's prefix-sum
+            # partition with quant-block-aware family units
+            # (GGUFConfig.group_size keeps every cut on K-quant
+            # superblock boundaries).
+            logger.info(
+                "GGUF: loading with uneven tensor parallelism "
+                "(--rank-tp-ratio %s).",
+                get_tp_partition_ratios(),
             )
         adapter = self._prepare_adapter(model_config)
         model.load_weights(adapter.prepare_weights(model_config))

@@ -29,6 +29,12 @@ if TYPE_CHECKING:
 class GGUFConfig(QuantizationConfig):
     """Config class for GGUF."""
 
+    #: Worst-case GGUF quant block granularity along the input dim
+    #: (K-quant superblocks). Consumed by the fork's unit-based
+    #: partitioning (v4 free uneven TP) so shard cuts land on block
+    #: boundaries; also satisfied by all smaller GGUF block types (32).
+    group_size = 256
+
     def __init__(self, unquantized_modules: list[str] | None = None) -> None:
         super().__init__()
         self.unquantized_modules = unquantized_modules or []

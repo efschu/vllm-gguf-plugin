@@ -22,11 +22,23 @@ def _resolve_gguf_weight_loader(
     layer: torch.nn.Module,
     fallback_weight_loader=None,
 ):
-    return (
-        layer.weight_loader_v2
-        if hasattr(layer, "weight_loader_v2")
-        else fallback_weight_loader
-    )
+    if hasattr(layer, "weight_loader_v2"):
+        return layer.weight_loader_v2
+
+    def _replicated_gguf_loader(param, loaded_weight, loaded_shard_id=None):
+        # Layers without a v2 loader (e.g. ReplicatedLinear — the MTP fc
+        # under uneven TP) hold lazy GGUF params: store the FULL tensor;
+        # dense params keep the original fallback behavior.
+        if hasattr(param, "_store"):
+            param._store(loaded_weight, shard_id=loaded_shard_id)
+            return
+        assert fallback_weight_loader is not None
+        if loaded_shard_id is None:
+            fallback_weight_loader(param, loaded_weight)
+        else:
+            fallback_weight_loader(param, loaded_weight, loaded_shard_id)
+
+    return _replicated_gguf_loader
 
 
 def _resolve_gguf_weight_type_loader(
@@ -214,30 +226,82 @@ def _gguf_moe_weight_type_loader(
     return True if return_success else None
 
 
+def _uneven_partition_sizes(total: int, tp_size: int, units):
+    """Fork helper passthrough: per-rank sizes of a dimension under
+    --rank-tp-ratio (with the family unit count carried on the parameter
+    by the fork's linear layers); classic even split otherwise / on
+    older vLLM."""
+    try:
+        from vllm.distributed.utils import (
+            get_tp_partition_ratios,
+            tp_partition_sizes,
+        )
+    except ImportError:
+        return None
+    if not get_tp_partition_ratios():
+        return None
+    return tp_partition_sizes(total, tp_size, units)
+
+
 class _GGUFParamLoadMixin:
-    """Mixin providing GGUF parameter weight loading methods."""
+    """Mixin providing GGUF parameter weight loading methods.
+
+    Under the fork's uneven TP (--rank-tp-ratio) shard sizes and offsets
+    come from the per-rank partition (prefix sums) with the family unit
+    count the fork's linear layers attach to the parameter as
+    ``tp_units``; the packed GGUF layout stays block-aligned because the
+    unit granularity is quant-block aware (GGUFConfig.group_size).
+    """
+
+    def _shard_1d(
+        self, loaded_weight: torch.Tensor, dim: int, tp_rank: int, tp_size: int
+    ) -> torch.Tensor:
+        sizes = _uneven_partition_sizes(
+            loaded_weight.shape[dim], tp_size, getattr(self, "tp_units", None)
+        )
+        if sizes is None:
+            shard_size = loaded_weight.shape[dim] // tp_size
+            if shard_size <= 0:
+                return loaded_weight
+            return loaded_weight.narrow(dim, tp_rank * shard_size, shard_size)
+        return loaded_weight.narrow(dim, sum(sizes[:tp_rank]), sizes[tp_rank])
 
     def load_column_parallel_weight(self, loaded_weight: torch.Tensor):
         tp_rank = get_tensor_model_parallel_rank()
         tp_size = get_tensor_model_parallel_world_size()
         if tp_size > 1 and loaded_weight.ndim >= 1:
-            shard_size = loaded_weight.shape[0] // tp_size
-            if shard_size > 0:
-                loaded_weight = loaded_weight.narrow(
-                    0, tp_rank * shard_size, shard_size
-                )
+            loaded_weight = self._shard_1d(loaded_weight, 0, tp_rank, tp_size)
         self._store(loaded_weight)
 
     def load_row_parallel_weight(self, loaded_weight: torch.Tensor):
         tp_rank = get_tensor_model_parallel_rank()
         tp_size = get_tensor_model_parallel_world_size()
         if tp_size > 1 and loaded_weight.ndim >= 2:
-            shard_size = loaded_weight.shape[1] // tp_size
-            if shard_size > 0:
-                loaded_weight = loaded_weight.narrow(
-                    1, tp_rank * shard_size, shard_size
-                )
+            loaded_weight = self._shard_1d(loaded_weight, 1, tp_rank, tp_size)
         self._store(loaded_weight)
+
+    def _component_offset(
+        self, loaded_full: int, tp_rank: int, shard_size: int
+    ) -> int:
+        """Offset of this rank's shard inside one fused component of the
+        checkpoint tensor. Uneven TP: prefix sum of the partition (a
+        fully replicated component — shard == full — starts at 0)."""
+        try:
+            from vllm.distributed.utils import get_tp_partition_ratios
+            from vllm.model_executor.layers.linear import tp_loaded_shard_start
+        except ImportError:
+            return tp_rank * shard_size
+        if not get_tp_partition_ratios():
+            return tp_rank * shard_size
+        from vllm.distributed import get_tensor_model_parallel_world_size as _ws
+
+        return tp_loaded_shard_start(
+            loaded_full,
+            _ws(),
+            tp_rank,
+            shard_size,
+            getattr(self, "tp_units", None),
+        )
 
     def load_merged_column_weight(self, loaded_weight: torch.Tensor, **kwargs):
         shard_id = kwargs.get("shard_id")
@@ -249,7 +313,10 @@ class _GGUFParamLoadMixin:
             and shard_size > 0
             and shard_size < loaded_weight.shape[0]
         ):
-            loaded_weight = loaded_weight.narrow(0, tp_rank * shard_size, shard_size)
+            offset = self._component_offset(
+                loaded_weight.shape[0], tp_rank, shard_size
+            )
+            loaded_weight = loaded_weight.narrow(0, offset, shard_size)
         self._store(loaded_weight, shard_id=shard_id)
 
     def load_qkv_weight(self, loaded_weight: torch.Tensor, **kwargs):
@@ -263,12 +330,24 @@ class _GGUFParamLoadMixin:
             and shard_size > 0
             and shard_size < loaded_weight.shape[0]
         ):
-            effective_tp_rank = (
-                tp_rank // num_kv_head_replicas if shard_id in ("k", "v") else tp_rank
-            )
-            loaded_weight = loaded_weight.narrow(
-                0, effective_tp_rank * shard_size, shard_size
-            )
+            try:
+                from vllm.distributed.utils import get_tp_partition_ratios
+            except ImportError:
+                get_tp_partition_ratios = lambda: None
+            if get_tp_partition_ratios():
+                # q: prefix sum over the head partition; a replicated kv
+                # component never reaches here (shard == full).
+                offset = self._component_offset(
+                    loaded_weight.shape[0], tp_rank, shard_size
+                )
+            else:
+                effective_tp_rank = (
+                    tp_rank // num_kv_head_replicas
+                    if shard_id in ("k", "v")
+                    else tp_rank
+                )
+                offset = effective_tp_rank * shard_size
+            loaded_weight = loaded_weight.narrow(0, offset, shard_size)
         self._store(loaded_weight, shard_id=shard_id)
 
 
