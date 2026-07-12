@@ -1455,6 +1455,75 @@ template <int mmq_y, int nwarps, bool need_check> static __device__ __forceinlin
     }
 }
 
+// Staged variant of load_tiles_q5_K. block_q5_K is 176 bytes — a
+// multiple of 16 — so like Q4_K the in-window offset is always 0 and
+// the aligned 4-byte reads stay valid.
+template <int mmq_y, int nwarps, int win, bool need_check> static __device__ __forceinline__ void load_tiles_q5_K_stage(
+    const char * __restrict__ stage, const int64_t g0, const int bpr,
+    int * __restrict__ x_ql, half2 * __restrict__ x_dm,
+    int * __restrict__ x_sc, const int & i_offset, const int & i_max, const int & k) {
+    const int kqsx = k % QI5_K;  // QI5_K == WARP_SIZE_GGUF: kbx/kbxd == 0
+
+#pragma unroll
+    for (int i0 = 0; i0 < mmq_y; i0 += nwarps) {
+        int i = i0 + i_offset;
+
+        if (need_check) {
+            i = min(i, i_max);
+        }
+
+        const block_q5_K * bxi = (const block_q5_K *)(stage + i*win);
+        const int ky = QR5_K*kqsx;
+
+        const int ql = get_int_from_uint8_aligned(bxi->qs, kqsx);
+        const int ql0 = (ql >> 0) & 0x0F0F0F0F;
+        const int ql1 = (ql >> 4) & 0x0F0F0F0F;
+
+        const int qh = get_int_from_uint8_aligned(bxi->qh, kqsx % (QI5_K/4));
+        const int qh0 = ((qh >> (2 * (kqsx / (QI5_K/4)) + 0)) << 4) & 0x10101010;
+        const int qh1 = ((qh >> (2 * (kqsx / (QI5_K/4)) + 1)) << 4) & 0x10101010;
+
+        const int kq0 = ky - ky % (QI5_K/2) + k % (QI5_K/4) + 0;
+        const int kq1 = ky - ky % (QI5_K/2) + k % (QI5_K/4) + (QI5_K/4);
+
+        x_ql[i * (2*WARP_SIZE_GGUF + 1) + kq0] = ql0 | qh0;
+        x_ql[i * (2*WARP_SIZE_GGUF + 1) + kq1] = ql1 | qh1;
+    }
+
+#pragma unroll
+    for (int i0 = 0; i0 < mmq_y; i0 += nwarps * QI5_K) {
+        int i = (i0 + i_offset * QI5_K + k) % mmq_y;
+
+        if (need_check) {
+            i = min(i, i_max);
+        }
+
+        const block_q5_K * bxi = (const block_q5_K *)(stage + i*win);
+        x_dm[i * (WARP_SIZE_GGUF/QI5_K) + i / QI5_K] = bxi->dm;
+    }
+
+#pragma unroll
+    for (int i0 = 0; i0 < mmq_y; i0 += nwarps * 8) {
+        int i = (i0 + i_offset * 8 + k / (WARP_SIZE_GGUF/8)) % mmq_y;
+
+        if (need_check) {
+            i = min(i, i_max);
+        }
+
+        const block_q5_K * bxi = (const block_q5_K *)(stage + i*win);
+
+        const int * scales = (const int *) bxi->scales;
+
+        const int ksc = k % (WARP_SIZE_GGUF/8);
+
+        // scale arrangement after the following two lines: sc0,...,sc3, sc4,...,sc7, m0,...,m3, m4,...,m8
+        int scales8 = (scales[(ksc%2) + (ksc!=0)] >> (4 * (ksc & (ksc/2)))) & 0x0F0F0F0F; // lower 4 bits
+        scales8    |= (scales[ksc/2]              >> (2 * (ksc % 2)))       & 0x30303030; // upper 2 bits
+
+        x_sc[i * (WARP_SIZE_GGUF/8) + i / 8 + ksc] = scales8;
+    }
+}
+
 static __device__ __forceinline__ float vec_dot_q5_K_q8_1_mul_mat(
     const int * __restrict__ x_ql, const half2 * __restrict__ x_dm, const int * __restrict__ x_qh, const int * __restrict__ x_sc,
     const int * __restrict__ y_qs, const half2 * __restrict__ y_ds, const int & i, const int & j, const int & k) {
