@@ -1264,6 +1264,58 @@ template <int mmq_y, int nwarps, bool need_check> static __device__ __forceinlin
     }
 }
 
+// Staged variant of load_tiles_q4_K (see load_tiles_q6_K_stage for the
+// scheme). block_q4_K is 144 bytes — a multiple of 16 — so every block
+// keeps the tensor's base alignment and the in-window offset is always
+// 0; the aligned 4-byte reads of the original therefore stay valid.
+template <int mmq_y, int nwarps, int win, bool need_check> static __device__ __forceinline__ void load_tiles_q4_K_stage(
+    const char * __restrict__ stage, const int64_t g0, const int bpr,
+    int * __restrict__ x_ql, half2 * __restrict__ x_dm,
+    int * __restrict__ x_sc, const int & i_offset, const int & i_max, const int & k) {
+    const int kqsx = k % QI4_K;  // QI4_K == WARP_SIZE_GGUF: kbx/kbxd == 0
+
+#pragma unroll
+    for (int i0 = 0; i0 < mmq_y; i0 += nwarps) {
+        int i = i0 + i_offset;
+
+        if (need_check) {
+            i = min(i, i_max);
+        }
+        const block_q4_K * bxi = (const block_q4_K *)(stage + i*win);
+        x_ql[i * (WARP_SIZE_GGUF + 1) + k] = get_int_from_uint8_aligned(bxi->qs, kqsx);
+    }
+
+#pragma unroll
+    for (int i0 = 0; i0 < mmq_y; i0 += nwarps * QI4_K) {
+        int i = (i0 + i_offset * QI4_K + k) % mmq_y;
+        if (need_check) {
+            i = min(i, i_max);
+        }
+        const block_q4_K * bxi = (const block_q4_K *)(stage + i*win);
+        x_dm[i * (WARP_SIZE_GGUF/QI4_K) + i / QI4_K] = bxi->dm;
+    }
+
+#pragma unroll
+    for (int i0 = 0; i0 < mmq_y; i0 += nwarps * 8) {
+        int i = (i0 + i_offset * 8 + k / (WARP_SIZE_GGUF/8)) % mmq_y;
+
+        if (need_check) {
+            i = min(i, i_max);
+        }
+
+        const block_q4_K * bxi = (const block_q4_K *)(stage + i*win);
+
+        const int * scales = (const int *) bxi->scales;
+
+        const int ksc = k % (WARP_SIZE_GGUF/8);
+        // scale arrangement after the following two lines: sc0,...,sc3, sc4,...,sc7, m0,...,m3, m4,...,m8
+        int scales8 = (scales[(ksc%2) + (ksc!=0)] >> (4 * (ksc & (ksc/2)))) & 0x0F0F0F0F; // lower 4 bits
+        scales8    |= (scales[ksc/2]              >> (2 * (ksc % 2)))       & 0x30303030; // upper 2 bits
+
+        x_sc[i * (WARP_SIZE_GGUF/8) + i / 8 + ksc] = scales8;
+    }
+}
+
 static __device__ __forceinline__ float vec_dot_q4_K_q8_1_mul_mat(
     const int * __restrict__ x_ql, const half2 * __restrict__ x_dm, const int * __restrict__ x_qh, const int * __restrict__ x_sc,
     const int * __restrict__ y_qs, const half2 * __restrict__ y_ds, const int & i, const int & j, const int & k) {
@@ -1510,6 +1562,81 @@ template <int mmq_y, int nwarps, bool need_check> static __device__ __forceinlin
         }
 
         const block_q6_K * bxi = bx0 + i*blocks_per_row + (k % (WARP_SIZE_GGUF/8)) / 4;
+
+        x_sc[i * (WARP_SIZE_GGUF/8) + i / 8 + k % (WARP_SIZE_GGUF/8)] = get_int_from_int8(bxi->scales, k % (QI6_K/8));
+    }
+}
+
+// Variant of load_tiles_q6_K that dequantizes from a shared-memory
+// staging buffer (filled by cp.async double buffering, see
+// mul_mat_q_cpasync in mmq.cuh) instead of from global memory. Row i's
+// raw block sits at stage + i*win, shifted by the 16-byte misalignment
+// of its global address (blocks are 210 bytes, so consecutive blocks
+// alternate alignment; the staging copy starts at the aligned-down
+// address). g0/bpr reproduce that global block index: block of row i
+// is g0 + i*bpr. All field reads are 16-bit safe (get_int_from_*),
+// so the even offset is fine.
+template <int mmq_y, int nwarps, int win, bool need_check> static __device__ __forceinline__ void load_tiles_q6_K_stage(
+    const char * __restrict__ stage, const int64_t g0, const int bpr,
+    int * __restrict__ x_ql, half2 * __restrict__ x_dm,
+    int * __restrict__ x_sc, const int & i_offset, const int & i_max, const int & k) {
+    // QI6_K == WARP_SIZE_GGUF: exactly one block per row per K-tile,
+    // kbx and kbxd of the global-memory variant are always 0.
+    const int kqsx = k % QI6_K;
+
+#pragma unroll
+    for (int i0 = 0; i0 < mmq_y; i0 += nwarps) {
+        int i = i0 + i_offset;
+
+        if (need_check) {
+            i = min(i, i_max);
+        }
+
+        const block_q6_K * bxi = (const block_q6_K *)(stage + i*win +
+            (int)(((g0 + (int64_t) i*bpr) * (int64_t) sizeof(block_q6_K)) & 15));
+        const int ky = QR6_K*kqsx;
+
+        const int ql = get_int_from_uint8(bxi->ql, kqsx);
+        const int ql0 = (ql >> 0) & 0x0F0F0F0F;
+        const int ql1 = (ql >> 4) & 0x0F0F0F0F;
+
+        const int qh = get_int_from_uint8(bxi->qh, (QI6_K/4) * (kqsx / (QI6_K/2)) + kqsx % (QI6_K/4));
+        const int qh0 = ((qh >> (2 * ((kqsx % (QI6_K/2)) / (QI6_K/4)))) << 4) & 0x30303030;
+        const int qh1 =  (qh >> (2 * ((kqsx % (QI6_K/2)) / (QI6_K/4))))       & 0x30303030;
+
+        const int kq0 = ky - ky % QI6_K + k % (QI6_K/2) + 0;
+        const int kq1 = ky - ky % QI6_K + k % (QI6_K/2) + (QI6_K/2);
+
+        x_ql[i * (2*WARP_SIZE_GGUF + 1) + kq0] = __vsubss4(ql0 | qh0, 0x20202020);
+        x_ql[i * (2*WARP_SIZE_GGUF + 1) + kq1] = __vsubss4(ql1 | qh1, 0x20202020);
+    }
+
+    float * x_dmf = (float *) x_dm;
+
+#pragma unroll
+    for (int i0 = 0; i0 < mmq_y; i0 += nwarps * QI6_K) {
+        int i = (i0 + i_offset * QI6_K + k) % mmq_y;
+
+        if (need_check) {
+            i = min(i, i_max);
+        }
+
+        const block_q6_K * bxi = (const block_q6_K *)(stage + i*win +
+            (int)(((g0 + (int64_t) i*bpr) * (int64_t) sizeof(block_q6_K)) & 15));
+
+        x_dmf[i * (WARP_SIZE_GGUF/QI6_K) + i / QI6_K] = __half2float(bxi->d);
+    }
+
+#pragma unroll
+    for (int i0 = 0; i0 < mmq_y; i0 += nwarps * 8) {
+        int i = (i0 + i_offset * 8 + k / (WARP_SIZE_GGUF/8)) % mmq_y;
+
+        if (need_check) {
+            i = min(i, i_max);
+        }
+
+        const block_q6_K * bxi = (const block_q6_K *)(stage + i*win +
+            (int)(((g0 + (int64_t) i*bpr) * (int64_t) sizeof(block_q6_K)) & 15));
 
         x_sc[i * (WARP_SIZE_GGUF/8) + i / 8 + k % (WARP_SIZE_GGUF/8)] = get_int_from_int8(bxi->scales, k % (QI6_K/8));
     }

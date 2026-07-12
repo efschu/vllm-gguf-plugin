@@ -103,6 +103,200 @@ static __device__ __forceinline__ void mul_mat_q(
     }
 }
 
+#if !defined(USE_ROCM)
+// ---- cp.async (sm80+) raw-block staging for the small-batch path ----
+//
+// The classic load_tiles dequantizes straight from global memory with
+// synchronous gather loads, so the SM stalls on DRAM latency between
+// K-tiles (measured ~350 of ~600 GB/s achievable on a 3080). Here the
+// RAW quant blocks of the next K-tile are copied into a double-buffered
+// shared staging area with cp.async while the current tile is being
+// dequantized and multiplied; the dequant logic itself is unchanged,
+// it just reads from shared instead of global.
+
+static __device__ __forceinline__ void gguf_cp_async16(void * smem, const void * gmem) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
+    const unsigned s = (unsigned) __cvta_generic_to_shared(smem);
+    asm volatile("cp.async.cg.shared.global [%0], [%1], 16;\n" :: "r"(s), "l"(gmem));
+#endif
+}
+
+static __device__ __forceinline__ void gguf_cp_commit() {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
+    asm volatile("cp.async.commit_group;\n");
+#endif
+}
+
+static __device__ __forceinline__ void gguf_cp_wait_all() {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
+    asm volatile("cp.async.wait_group 0;\n");
+#endif
+}
+
+// Copy the raw blocks of one K-tile (one fetch of fetch_bytes per row)
+// into the staging buffer. Each row's copy starts at the 16-byte
+// aligned-down global address (blocks are not 16-byte aligned; the
+// dequant side recomputes the same misalignment offset), win covers
+// fetch_bytes plus up to 14 bytes of misalignment. Reads may overrun
+// the tensor by <win-fetch_bytes> bytes on the very last block; torch's
+// caching allocator rounds allocations up, so the page is always valid.
+template <int mmq_y, int nwarps, int fetch_bytes, int win, bool need_check>
+static __device__ __forceinline__ void gguf_stage_tile(
+    const char * __restrict__ gbase, const int64_t g0, const int bpr,
+    char * __restrict__ sbuf, const int i_max) {
+    constexpr int chunks = win / 16;
+    const int tid = threadIdx.y*WARP_SIZE_GGUF + threadIdx.x;
+#pragma unroll 4
+    for (int c = tid; c < mmq_y*chunks; c += nwarps*WARP_SIZE_GGUF) {
+        const int r  = c / chunks;
+        const int ch = c % chunks;
+        const int i = need_check ? min(r, i_max) : r;
+        const int64_t off = (g0 + (int64_t) i*bpr) * (int64_t) fetch_bytes;
+        const char * src = gbase + (off & ~(int64_t) 15);
+        gguf_cp_async16(sbuf + r*win + ch*16, src + ch*16);
+    }
+}
+
+// Function-pointer type of the *_stage dequant loaders (see vecdotq.cuh).
+typedef void (*load_tiles_stage_cuda_t)(
+    const char * stage, const int64_t g0, const int bpr,
+    int * x_ql, half2 * x_dm, int * x_sc,
+    const int & i_offset, const int & i_max, const int & k);
+
+// mul_mat_q with cp.async double-buffered staging of the x tiles.
+// Identical to mul_mat_q except that the K-loop prefetches the next
+// tile's raw blocks while dequantizing/multiplying the current one.
+template <typename scalar_t, int qk, int qr, int qi, bool need_sum, typename block_q_t, int mmq_x, int mmq_y, int nwarps,
+              allocate_tiles_cuda_t allocate_tiles, load_tiles_stage_cuda_t load_tiles_stage, int vdr, vec_dot_q_mul_mat_cuda_t vec_dot>
+static __device__ __forceinline__ void mul_mat_q_cpasync(
+    const void * __restrict__ vx, const void * __restrict__ vy, scalar_t * __restrict__ dst,
+    const int ncols_x, const int nrows_x, const int ncols_y, const int nrows_y, const int nrows_dst) {
+
+    const block_q8_1 * y = (const block_q8_1 *) vy;
+
+    const int blocks_per_row_x = ncols_x / qk;
+    const int blocks_per_col_y = nrows_y / QK8_1;
+    constexpr int blocks_per_warp = WARP_SIZE_GGUF / qi;
+
+    const int & ncols_dst = ncols_y;
+
+    const auto row_dst_0 = blockIdx.x*mmq_y;
+    const int & row_x_0 = row_dst_0;
+
+    const auto col_dst_0 = blockIdx.y*mmq_x;
+    const int & col_y_0 = col_dst_0;
+
+    int   * tile_x_ql = nullptr;
+    half2 * tile_x_dm = nullptr;
+    int   * tile_x_qh = nullptr;
+    int   * tile_x_sc = nullptr;
+
+    allocate_tiles(&tile_x_ql, &tile_x_dm, &tile_x_qh, &tile_x_sc);
+
+    __shared__ int    tile_y_qs[mmq_x * WARP_SIZE_GGUF];
+    __shared__ half2  tile_y_ds[mmq_x * WARP_SIZE_GGUF/QI8_1];
+
+    constexpr int fetch_bytes = blocks_per_warp * (int) sizeof(block_q_t);
+    constexpr int win = (fetch_bytes + 14 + 15) & ~15;
+    // 16-byte alignment is load-bearing: cp.async destinations must be
+    // 16-aligned, and the dequant side does 2-byte reads at even offsets.
+    __shared__ alignas(16) char stage[2][mmq_y * win];
+
+    float sum[mmq_y/WARP_SIZE_GGUF][mmq_x/nwarps] = {{0.0f}};
+
+    const char * gbase = (const char *) vx;
+    const int64_t g_row0 = (int64_t) row_x_0 * blocks_per_row_x;
+    const int i_max = nrows_x - row_x_0 - 1;
+
+    int cur = 0;
+    gguf_stage_tile<mmq_y, nwarps, fetch_bytes, win, true>(
+        gbase, g_row0, blocks_per_row_x, stage[0], i_max);
+    gguf_cp_commit();
+
+    for (int ib0 = 0; ib0 < blocks_per_row_x; ib0 += blocks_per_warp) {
+
+        gguf_cp_wait_all();
+        __syncthreads();
+
+        if (ib0 + blocks_per_warp < blocks_per_row_x) {
+            gguf_stage_tile<mmq_y, nwarps, fetch_bytes, win, true>(
+                gbase, g_row0 + ib0 + blocks_per_warp, blocks_per_row_x,
+                stage[cur ^ 1], i_max);
+            gguf_cp_commit();
+        }
+
+        load_tiles_stage(stage[cur], g_row0 + ib0, blocks_per_row_x,
+                         tile_x_ql, tile_x_dm, tile_x_sc,
+                         threadIdx.y, i_max, threadIdx.x);
+
+#pragma unroll
+        for (int ir = 0; ir < qr && ib0 + ir * blocks_per_warp/qr < blocks_per_row_x; ++ir) {
+            const auto kqs = ir*WARP_SIZE_GGUF + threadIdx.x;
+            const int kbxd = kqs / QI8_1;
+
+#pragma unroll
+            for (int i = 0; i < mmq_x; i += nwarps) {
+                const int col_y_eff = min(col_y_0 + threadIdx.y + i, ncols_y-1); // to prevent out-of-bounds memory accesses
+                const block_q8_1 * by0 = &y[col_y_eff*blocks_per_col_y + ib0 * (qk/QK8_1) + kbxd];
+                const int index_y = (threadIdx.y + i) * WARP_SIZE_GGUF + kqs % WARP_SIZE_GGUF;
+                tile_y_qs[index_y] = get_int_from_int8_aligned(by0->qs, threadIdx.x % QI8_1);
+            }
+
+#pragma unroll
+            for (int ids0 = 0; ids0 < mmq_x; ids0 += nwarps * QI8_1) {
+                const int ids = (ids0 + threadIdx.y * QI8_1 + threadIdx.x / (WARP_SIZE_GGUF/QI8_1)) % mmq_x;
+                const auto kby = threadIdx.x % (WARP_SIZE_GGUF/QI8_1);
+                const int col_y_eff = min(col_y_0 + ids, ncols_y-1);
+
+                // if the sum is not needed it's faster to transform the scale to f32 ahead of time
+                const half2 * dsi_src = &y[col_y_eff*blocks_per_col_y + ib0 * (qk/QK8_1) + ir*(WARP_SIZE_GGUF/QI8_1) + kby].ds;
+                half2       * dsi_dst = &tile_y_ds[ids * (WARP_SIZE_GGUF/QI8_1) + kby];
+                if (need_sum) {
+                    *dsi_dst = *dsi_src;
+                } else {
+                    float * dfi_dst = (float *) dsi_dst;
+                    *dfi_dst = __low2float(*dsi_src);
+                }
+            }
+
+            __syncthreads();
+
+// #pragma unroll // unrolling this loop causes too much register pressure
+            for (int k = ir*WARP_SIZE_GGUF/qr; k < (ir+1)*WARP_SIZE_GGUF/qr; k += vdr) {
+#pragma unroll
+                for (int j = 0; j < mmq_x; j += nwarps) {
+#pragma unroll
+                    for (int i = 0; i < mmq_y; i += WARP_SIZE_GGUF) {
+                        sum[i/WARP_SIZE_GGUF][j/nwarps] += vec_dot(
+                            tile_x_ql, tile_x_dm, tile_x_qh, tile_x_sc, tile_y_qs, tile_y_ds,
+                            threadIdx.x + i, threadIdx.y + j, k);
+                    }
+                }
+            }
+            __syncthreads();
+        }
+        cur ^= 1;
+    }
+
+#pragma unroll
+    for (int j = 0; j < mmq_x; j += nwarps) {
+        const auto col_dst = col_dst_0 + j + threadIdx.y;
+        if (col_dst >= ncols_dst) {
+            return;
+        }
+
+#pragma unroll
+        for (int i = 0; i < mmq_y; i += WARP_SIZE_GGUF) {
+            const auto row_dst = row_dst_0 + threadIdx.x + i;
+            if (row_dst >= nrows_dst) {
+                continue;
+            }
+            dst[col_dst*nrows_dst + row_dst] = sum[i/WARP_SIZE_GGUF][j/nwarps];
+        }
+    }
+}
+#endif // !defined(USE_ROCM)
+
 // Runtime tile selection for the small-batch (decode) kernels. The
 // taller 128-row tile amortizes load_tiles better (wins on Ampere for
 // large weights: 0.215 vs 0.231 ms), but produces half as many row
@@ -128,6 +322,74 @@ static inline int gguf_small_tile(const int nrows_x) {
     return forced;
   }
   return (nrows_x + 127) / 128 >= sm_count ? 128 : 64;
+}
+
+// Whether the small-batch path should use the cp.async staging kernels.
+// Auto: on for SM major 8 (Ampere/Ada — measured latency-bound there);
+// VLLM_GGUF_MMQ_CPASYNC=1 forces it on any sm80+, =0 disables.
+static inline bool gguf_use_cpasync() {
+#if defined(USE_ROCM)
+    return false;
+#else
+    static int v = -1;
+    if (v < 0) {
+        int d = 0;
+        cudaGetDevice(&d);
+        cudaDeviceProp prop;
+        cudaGetDeviceProperties(&prop, d);
+        const char* e = getenv("VLLM_GGUF_MMQ_CPASYNC");
+        if (e && e[0]) {
+            v = (atoi(e) != 0 && prop.major >= 8) ? 1 : 0;
+        } else {
+            v = prop.major == 8 ? 1 : 0;
+        }
+    }
+    return v == 1;
+#endif
+}
+
+// Tile-height planner for the cp.async path. Per candidate the runtime
+// is roughly (waves needed to cover all row blocks) x (per-wave work),
+// where per-wave work = tile height + a fixed per-block overhead (y-tile
+// loads and K-loop bookkeeping cost the same regardless of height;
+// measured: 32 rows of overhead fits ffn_down N=5120 -> 64 and keeps
+// N~2k -> 32, where the 64 tile would idle half the SMs). Ties go to
+// the taller tile. VLLM_GGUF_MMQ_TILE forces (32/64/128).
+static inline int gguf_small_tile_ca(const int nrows_x) {
+    static int forced = -1;
+    static int sm_count = -1;
+    if (forced < 0) {
+        const char* e = getenv("VLLM_GGUF_MMQ_TILE");
+        forced = (e && atoi(e) > 0) ? atoi(e) : 0;
+        if (forced && forced != 32 && forced != 64 && forced != 128) {
+            forced = forced >= 128 ? 128 : (forced >= 64 ? 64 : 32);
+        }
+        int d = 0;
+        cudaGetDevice(&d);
+        cudaDeviceProp prop;
+        cudaGetDeviceProperties(&prop, d);
+        sm_count = prop.multiProcessorCount;
+    }
+    if (forced) {
+        return forced;
+    }
+    // 128 means "plain tall tile" (no cp.async staging — it would not
+    // fit the static shared limit): only worth it when it still fills
+    // every SM; then it is not latency-bound and saves y-tile reloads.
+    if ((nrows_x + 127) / 128 >= sm_count) {
+        return 128;
+    }
+    int best = 64;
+    long best_cost = 0x7fffffffL;
+    for (int t = 32; t <= 64; t *= 2) {
+        const int blocks = (nrows_x + t - 1) / t;
+        const long cost = (long) ((blocks + sm_count - 1) / sm_count) * (t + 32);
+        if (cost < best_cost || (cost == best_cost && t > best)) {
+            best = t;
+            best_cost = cost;
+        }
+    }
+    return best;
 }
 
 
@@ -941,10 +1203,50 @@ mul_mat_q4_K_small128(
         (vx, vy, dst, ncols_x, nrows_x, ncols_y, nrows_y, nrows_dst);
 }
 
+#if !defined(USE_ROCM)
+// Small-batch Q4_K with cp.async raw-block staging (see mul_mat_q_cpasync).
+template<typename scalar_t, int mmq_y, bool need_check> static __global__ void
+mul_mat_q4_K_small_ca(
+    const void * __restrict__ vx, const void * __restrict__ vy, scalar_t * __restrict__ dst,
+    const int ncols_x, const int nrows_x, const int ncols_y, const int nrows_y, const int nrows_dst) {
+    const int mmq_x  = 8;
+    const int nwarps = 8;
+
+    mul_mat_q_cpasync<scalar_t, QK_K, QR4_K, QI4_K, true, block_q4_K, mmq_x, mmq_y, nwarps, allocate_tiles_q4_K<mmq_y>,
+        load_tiles_q4_K_stage<mmq_y, nwarps, ((int) sizeof(block_q4_K) + 14 + 15) & ~15, need_check>, VDR_Q4_K_Q8_1_MMQ, vec_dot_q4_K_q8_1_mul_mat>
+        (vx, vy, dst, ncols_x, nrows_x, ncols_y, nrows_y, nrows_dst);
+}
+#endif
+
 template<typename scalar_t>
 static void ggml_mul_mat_q4_K_q8_1_cuda(
     const void * vx, const void * vy, scalar_t * dst, const int ncols_x, const int nrows_x,
     const int ncols_y, const int nrows_y, const int nrows_dst, cudaStream_t stream) {
+#if !defined(USE_ROCM)
+    if (ncols_y <= 8 && gguf_use_cpasync()) {
+        const int t = gguf_small_tile_ca(nrows_x);
+        if (t != 128) {
+            const dim3 block_nums((nrows_x + t - 1) / t, 1, 1);
+            const dim3 block_dims(WARP_SIZE_GGUF, 8, 1);
+            if (t == 32) {
+                if (nrows_x % 32 == 0)
+                    mul_mat_q4_K_small_ca<scalar_t, 32, false><<<block_nums, block_dims, 0, stream>>>
+                        (vx, vy, dst, ncols_x, nrows_x, ncols_y, nrows_y, nrows_dst);
+                else
+                    mul_mat_q4_K_small_ca<scalar_t, 32, true><<<block_nums, block_dims, 0, stream>>>
+                        (vx, vy, dst, ncols_x, nrows_x, ncols_y, nrows_y, nrows_dst);
+            } else {
+                if (nrows_x % 64 == 0)
+                    mul_mat_q4_K_small_ca<scalar_t, 64, false><<<block_nums, block_dims, 0, stream>>>
+                        (vx, vy, dst, ncols_x, nrows_x, ncols_y, nrows_y, nrows_dst);
+                else
+                    mul_mat_q4_K_small_ca<scalar_t, 64, true><<<block_nums, block_dims, 0, stream>>>
+                        (vx, vy, dst, ncols_x, nrows_x, ncols_y, nrows_y, nrows_dst);
+            }
+            return;
+        }
+    }
+#endif
     if (ncols_y <= 8) {
         const int small_y = gguf_small_tile(nrows_x);
         const dim3 block_nums((nrows_x + small_y - 1) / small_y, 1, 1);
@@ -1154,10 +1456,57 @@ mul_mat_q6_K_small128(
         (vx, vy, dst, ncols_x, nrows_x, ncols_y, nrows_y, nrows_dst);
 }
 
+#if !defined(USE_ROCM)
+// Small-batch Q6_K with cp.async raw-block staging (see mul_mat_q_cpasync).
+// mmq_y as template param: with the load latency hidden, the tile height
+// only decides SM utilization (wave count/tail), so the launcher picks it
+// per shape from a cost model.
+template<typename scalar_t, int mmq_y, bool need_check> static __global__ void
+mul_mat_q6_K_small_ca(
+    const void * __restrict__ vx, const void * __restrict__ vy, scalar_t * __restrict__ dst,
+    const int ncols_x, const int nrows_x, const int ncols_y, const int nrows_y, const int nrows_dst) {
+    const int mmq_x  = 8;
+    const int nwarps = 8;
+
+    mul_mat_q_cpasync<scalar_t, QK_K, QR6_K, QI6_K, false, block_q6_K, mmq_x, mmq_y, nwarps, allocate_tiles_q6_K<mmq_y>,
+        load_tiles_q6_K_stage<mmq_y, nwarps, ((int) sizeof(block_q6_K) + 14 + 15) & ~15, need_check>, VDR_Q6_K_Q8_1_MMQ, vec_dot_q6_K_q8_1_mul_mat>
+        (vx, vy, dst, ncols_x, nrows_x, ncols_y, nrows_y, nrows_dst);
+}
+
+#endif
+
 template<typename scalar_t>
 static void ggml_mul_mat_q6_K_q8_1_cuda(
     const void * vx, const void * vy, scalar_t * dst, const int ncols_x, const int nrows_x,
     const int ncols_y, const int nrows_y, const int nrows_dst, cudaStream_t stream) {
+#if !defined(USE_ROCM)
+    if (ncols_y <= 8 && gguf_use_cpasync()) {
+        const int t = gguf_small_tile_ca(nrows_x);
+        // t == 128 falls through to the plain path below: its staging
+        // buffer would exceed the 48 KB static shared limit, and at
+        // >= 1 block per SM the plain tall tile is not latency-bound.
+        if (t != 128) {
+            const dim3 block_nums((nrows_x + t - 1) / t, 1, 1);
+            const dim3 block_dims(WARP_SIZE_GGUF, 8, 1);
+            if (t == 32) {
+                if (nrows_x % 32 == 0)
+                    mul_mat_q6_K_small_ca<scalar_t, 32, false><<<block_nums, block_dims, 0, stream>>>
+                        (vx, vy, dst, ncols_x, nrows_x, ncols_y, nrows_y, nrows_dst);
+                else
+                    mul_mat_q6_K_small_ca<scalar_t, 32, true><<<block_nums, block_dims, 0, stream>>>
+                        (vx, vy, dst, ncols_x, nrows_x, ncols_y, nrows_y, nrows_dst);
+            } else {
+                if (nrows_x % 64 == 0)
+                    mul_mat_q6_K_small_ca<scalar_t, 64, false><<<block_nums, block_dims, 0, stream>>>
+                        (vx, vy, dst, ncols_x, nrows_x, ncols_y, nrows_y, nrows_dst);
+                else
+                    mul_mat_q6_K_small_ca<scalar_t, 64, true><<<block_nums, block_dims, 0, stream>>>
+                        (vx, vy, dst, ncols_x, nrows_x, ncols_y, nrows_y, nrows_dst);
+            }
+            return;
+        }
+    }
+#endif
     if (ncols_y <= 8) {
         const int small_y = gguf_small_tile(nrows_x);
         const dim3 block_nums((nrows_x + small_y - 1) / small_y, 1, 1);
