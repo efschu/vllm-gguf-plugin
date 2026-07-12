@@ -38,6 +38,9 @@ from .utils import (
 # crossover on RTX 3080 / Q6_K 17408x5120: ~16 tokens; at 1600 tokens
 # dequant+GEMM is ~13x faster. Tune with VLLM_GGUF_MMQ_MAX_TOKENS.
 _MMQ_MAX_TOKENS = int(os.environ.get("VLLM_GGUF_MMQ_MAX_TOKENS", "16"))
+# Upper bound (MiB) for a single dequantized-weight transient; larger
+# weights are processed in row chunks (see the DEQUANT_TYPES branch).
+_DEQUANT_CHUNK_MIB = int(os.environ.get("VLLM_GGUF_DEQUANT_CHUNK_MIB", "192"))
 
 
 def _fused_mul_mat_gguf(
@@ -66,8 +69,31 @@ def _fused_mul_mat_gguf(
     elif qweight_type in DEQUANT_TYPES:
         block_size, type_size = gguf.GGML_QUANT_SIZES[qweight_type]
         shape = (qweight.shape[0], qweight.shape[1] // type_size * block_size)
-        weight = ops.ggml_dequantize(qweight, qweight_type, *shape, x.dtype)
-        y = x @ weight.T
+        # Cap the dequant workspace: a monolithic fp16 copy of a large
+        # weight (e.g. the lm_head vocab shard, >500 MiB) is a transient
+        # that must fit as ONE contiguous block — after hours of serving
+        # the allocator is fragmented enough that this OOMs long-context
+        # requests even though total free memory would suffice. Dequantize
+        # and matmul in row chunks instead; cuBLAS throughput is unchanged
+        # (same total FLOPs, chunk >= 8192 rows keeps tiles saturated).
+        n_rows = shape[0]
+        chunk_bytes = _DEQUANT_CHUNK_MIB * 1024 * 1024
+        row_bytes = shape[1] * x.element_size()
+        rows_per_chunk = max(8192, chunk_bytes // max(row_bytes, 1))
+        if n_rows <= rows_per_chunk:
+            weight = ops.ggml_dequantize(qweight, qweight_type, *shape, x.dtype)
+            y = x @ weight.T
+        else:
+            blocks_per_row = qweight.shape[1]
+            y = torch.empty(
+                x.shape[0], n_rows, dtype=x.dtype, device=x.device
+            )
+            for r0 in range(0, n_rows, rows_per_chunk):
+                r1 = min(r0 + rows_per_chunk, n_rows)
+                weight = ops.ggml_dequantize(
+                    qweight[r0:r1], qweight_type, r1 - r0, shape[1], x.dtype
+                )
+                torch.matmul(x, weight.T, out=y[:, r0:r1])
     else:
         qweight_type = WeightType(qweight_type)
         raise NotImplementedError(f"Unsupported GGUF quantization type: {qweight_type}")
