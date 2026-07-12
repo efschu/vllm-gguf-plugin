@@ -195,8 +195,13 @@ static __device__ __forceinline__ void mul_mat_q_cpasync(
 
     allocate_tiles(&tile_x_ql, &tile_x_dm, &tile_x_qh, &tile_x_sc);
 
-    __shared__ int    tile_y_qs[mmq_x * WARP_SIZE_GGUF];
-    __shared__ half2  tile_y_ds[mmq_x * WARP_SIZE_GGUF/QI8_1];
+    // All qr y-sub-tiles live in shared at once (slice ir at offset
+    // ir*mmq_x rows), so one K-tile needs a single barrier pair instead
+    // of one per ir — half the __syncthreads of the classic loop.
+    // vec_dot needs no change: passing j + ir*mmq_x lands its y
+    // indexing in the right slice.
+    __shared__ int    tile_y_qs[qr * mmq_x * WARP_SIZE_GGUF];
+    __shared__ half2  tile_y_ds[qr * mmq_x * WARP_SIZE_GGUF/QI8_1];
 
     constexpr int fetch_bytes = blocks_per_warp * (int) sizeof(block_q_t);
     constexpr int win = (fetch_bytes + 14 + 15) & ~15;
@@ -240,7 +245,7 @@ static __device__ __forceinline__ void mul_mat_q_cpasync(
             for (int i = 0; i < mmq_x; i += nwarps) {
                 const int col_y_eff = min(col_y_0 + threadIdx.y + i, ncols_y-1); // to prevent out-of-bounds memory accesses
                 const block_q8_1 * by0 = &y[col_y_eff*blocks_per_col_y + ib0 * (qk/QK8_1) + kbxd];
-                const int index_y = (threadIdx.y + i) * WARP_SIZE_GGUF + kqs % WARP_SIZE_GGUF;
+                const int index_y = (ir*mmq_x + threadIdx.y + i) * WARP_SIZE_GGUF + kqs % WARP_SIZE_GGUF;
                 tile_y_qs[index_y] = get_int_from_int8_aligned(by0->qs, threadIdx.x % QI8_1);
             }
 
@@ -252,7 +257,7 @@ static __device__ __forceinline__ void mul_mat_q_cpasync(
 
                 // if the sum is not needed it's faster to transform the scale to f32 ahead of time
                 const half2 * dsi_src = &y[col_y_eff*blocks_per_col_y + ib0 * (qk/QK8_1) + ir*(WARP_SIZE_GGUF/QI8_1) + kby].ds;
-                half2       * dsi_dst = &tile_y_ds[ids * (WARP_SIZE_GGUF/QI8_1) + kby];
+                half2       * dsi_dst = &tile_y_ds[(ir*mmq_x + ids) * (WARP_SIZE_GGUF/QI8_1) + kby];
                 if (need_sum) {
                     *dsi_dst = *dsi_src;
                 } else {
@@ -260,9 +265,12 @@ static __device__ __forceinline__ void mul_mat_q_cpasync(
                     *dfi_dst = __low2float(*dsi_src);
                 }
             }
+        }
 
-            __syncthreads();
+        __syncthreads();
 
+#pragma unroll
+        for (int ir = 0; ir < qr && ib0 + ir * blocks_per_warp/qr < blocks_per_row_x; ++ir) {
 // #pragma unroll // unrolling this loop causes too much register pressure
             for (int k = ir*WARP_SIZE_GGUF/qr; k < (ir+1)*WARP_SIZE_GGUF/qr; k += vdr) {
 #pragma unroll
@@ -271,12 +279,12 @@ static __device__ __forceinline__ void mul_mat_q_cpasync(
                     for (int i = 0; i < mmq_y; i += WARP_SIZE_GGUF) {
                         sum[i/WARP_SIZE_GGUF][j/nwarps] += vec_dot(
                             tile_x_ql, tile_x_dm, tile_x_qh, tile_x_sc, tile_y_qs, tile_y_ds,
-                            threadIdx.x + i, threadIdx.y + j, k);
+                            threadIdx.x + i, ir*mmq_x + threadIdx.y + j, k);
                     }
                 }
             }
-            __syncthreads();
         }
+        __syncthreads();
         cur ^= 1;
     }
 
